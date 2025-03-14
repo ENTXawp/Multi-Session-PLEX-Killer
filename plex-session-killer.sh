@@ -11,28 +11,46 @@
 # Dependencies: jq
 # ============================================================
 
-WAIT_TIME=10
+WAIT_TIME=60
 MAX_STREAMS=2
 USER_LOG="/tmp/user.log"
+# Create a temp file for each server to avoid appending issues
+SERVER_TEMP_LOG="/tmp/server_temp.log"
+
+# Add an array of exempt users who won't be limited
+EXEMPT_USERS=(
+  "Admin9705"
+  "dunnarmy"
+  # Add more exempt users as needed
+)
 
 TAUTULLI_API_KEYS=(
-  "dad9bbb78bde43249754b630b58fbf7c" #server 1
-  "f0a6722ac8ec4899abef2e9f32c6d7ca" #server 2
-  "" #server 3
+  "ebdb8c80fc2b461ea182243dbc1b27a1" #server 1
+  "d9e64926654741609b7db9294bca5e36" #server 2
+  "bbc8ad8796104f668ff1aba2fb69e1d7" #server 3
   "" #server 4
 )
 
-# WARNING, make sure the http or https is set correctly
-# This also works just for one server also, just add or delete the servers but make the "" stays
 TAUTULLI_URLS=(
-  "http://10.0.0.10/api/v2" #server 1
-  "http://10.0.0.15/api/v2" #server 2
-  "" #server 3
+  "http://10.0.0.10:8181/api/v2" #server 1
+  "http://10.0.0.10:8182/api/v2" #server 2
+  "http://10.0.0.10:8183/api/v2" #server 3
   "" #server 4
 )
 
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+# Function to check if a user is exempt
+is_exempt_user() {
+    local check_user="$1"
+    for exempt_user in "${EXEMPT_USERS[@]}"; do
+        if [ "$check_user" = "$exempt_user" ]; then
+            return 0  # True, user is exempt
+        fi
+    done
+    return 1  # False, user is not exempt
 }
 
 gather_server_sessions() {
@@ -58,14 +76,16 @@ gather_server_sessions() {
 
     if [ "$count" -gt 0 ]; then
         log_message "[${server_name}] Processing sessions:"
-        echo "$sessions_array" | jq -r --arg ak "$apikey" --arg surl "$url" '.[] | select(.username != null and .username != "") | "\(.username)|\(.session_id)|\(.session_key)|\($ak)|\($surl)"' > /tmp/temp_sessions.log
+        
+        # Use a separate file for this server's sessions
+        > "$SERVER_TEMP_LOG"
+        
+        echo "$sessions_array" | jq -r --arg ak "$apikey" --arg surl "$url" '.[] | select(.username != null and .username != "") | "\(.username)|\(.session_id)|\(.session_key)|\($ak)|\($surl)"' > "$SERVER_TEMP_LOG"
         
         while IFS='|' read -r username session_id session_key server_api server_url; do
             log_message "   User: $username, Session ID: $session_id"
             echo "$username $session_id $session_key $server_api $server_url" >> "$USER_LOG"
-        done < /tmp/temp_sessions.log
-        
-        rm -f /tmp/temp_sessions.log
+        done < "$SERVER_TEMP_LOG"
     fi
 }
 
@@ -77,19 +97,19 @@ kill_user_sessions() {
         log_message "  Terminating session ID: $session_id on server: $url"
         local enc_user
         enc_user=$(echo "$username" | sed 's/ /%20/g')
-        local msg="Too%20Many%20Streaming%20Sessions%20USER%20${enc_user}%20between%20all%20PLEX%20servers!%20Only%20${MAX_STREAMS}%20are%20allowed%20at%20a%20time!"
+        local msg="Too%20Many%20Streaming%20Sessions%20For%20USER%20${enc_user}%20between%20all%20PLEX%20servers!%20Only%20${MAX_STREAMS}%20are%20allowed%20at%20a%20time!"
         local resp
         resp=$(curl -s "${url}?apikey=${apikey}&cmd=terminate_session&session_id=${session_id}&session_key=${session_key}&message=${msg}")
         log_message "  Terminate response: ${resp}"
     done
 }
 
+# Main loop
 while true; do
     log_message "Starting multi-server Tautulli check..."
 
     # CRITICAL: Reset the user log file at the start of each cycle
-    rm -f "$USER_LOG"
-    touch "$USER_LOG"
+    > "$USER_LOG"  # More efficient than rm + touch
 
     # Reset the user_counts array completely for each new check
     unset user_counts
@@ -112,6 +132,16 @@ while true; do
     if [ -s "$USER_LOG" ]; then
         log_message "Processing user sessions from log file..."
         
+        # Create a temporary file to deduplicate sessions by user+session_id
+        > "/tmp/unique_sessions.log"
+        
+        # Use awk to deduplicate by username and session_id
+        awk '!seen[$1,$2]++' "$USER_LOG" > "/tmp/unique_sessions.log"
+        
+        # Clear user log and copy back deduplicated entries
+        > "$USER_LOG"
+        cat "/tmp/unique_sessions.log" > "$USER_LOG"
+        
         while read -r line; do
             # Extract username (first field)
             username=$(echo "$line" | awk '{print $1}')
@@ -125,11 +155,22 @@ while true; do
         # 3) Display user counts
         log_message "User session counts:"
         for user in "${!user_counts[@]}"; do
-            log_message "   $user: ${user_counts[$user]} session(s)"
+            # Check if user is exempt
+            if is_exempt_user "$user"; then
+                log_message "   $user: ${user_counts[$user]} session(s) [EXEMPT]"
+            else
+                log_message "   $user: ${user_counts[$user]} session(s)"
+            fi
         done
         
         # 4) Check for users exceeding limits and terminate their sessions
         for user in "${!user_counts[@]}"; do
+            # Skip exempt users
+            if is_exempt_user "$user"; then
+                log_message "USER $user is exempt from the stream limit (${user_counts[$user]} active streams)"
+                continue
+            fi
+            
             if [ "${user_counts[$user]}" -gt "$MAX_STREAMS" ]; then
                 log_message "USER $user has exceeded the stream limit! (${user_counts[$user]}/${MAX_STREAMS})"
                 kill_user_sessions "$user"
@@ -139,6 +180,10 @@ while true; do
         log_message "No active sessions found."
     fi
 
+    # Clean up temporary files
+    rm -f "/tmp/unique_sessions.log" "$SERVER_TEMP_LOG"
+
     log_message "Check complete. Waiting ${WAIT_TIME} seconds for next run..."
+    echo ""
     sleep "$WAIT_TIME"
 done
