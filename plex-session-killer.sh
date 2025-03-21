@@ -19,8 +19,8 @@ SERVER_TEMP_LOG="/tmp/server_temp.log"
 
 # Add an array of exempt users who won't be limited
 EXEMPT_USERS=(
-  "Admin9705"
-  "dunnarmy"
+  "User1"
+  "User2"
   # Add more exempt users as needed
 )
 
