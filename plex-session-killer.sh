@@ -47,10 +47,10 @@ is_exempt_user() {
     local check_user="$1"
     for exempt_user in "${EXEMPT_USERS[@]}"; do
         if [ "$check_user" = "$exempt_user" ]; then
-            return 0  # True, user is exempt
+            return 0
         fi
     done
-    return 1  # False, user is not exempt
+    return 1 # False, user is not exempt
 }
 
 gather_server_sessions() {
@@ -76,15 +76,17 @@ gather_server_sessions() {
 
     if [ "$count" -gt 0 ]; then
         log_message "[${server_name}] Processing sessions:"
-        
+
         # Use a separate file for this server's sessions
         > "$SERVER_TEMP_LOG"
         
-        echo "$sessions_array" | jq -r --arg ak "$apikey" --arg surl "$url" '.[] | select(.username != null and .username != "") | "\(.username)|\(.session_id)|\(.session_key)|\($ak)|\($surl)"' > "$SERVER_TEMP_LOG"
+        echo "$sessions_array" | jq -r --arg ak "$apikey" --arg surl "$url" \
+            '.[] | select(.username != null and .username != "") |
+            "\(.username)|\(.session_id)|\(.session_key)|\($ak)|\($surl)"' > "$SERVER_TEMP_LOG"
         
         while IFS='|' read -r username session_id session_key server_api server_url; do
             log_message "   User: $username, Session ID: $session_id"
-            echo "$username $session_id $session_key $server_api $server_url" >> "$USER_LOG"
+            echo "$username|$session_id|$session_key|$server_api|$server_url" >> "$USER_LOG"
         done < "$SERVER_TEMP_LOG"
     fi
 }
@@ -92,16 +94,18 @@ gather_server_sessions() {
 kill_user_sessions() {
     local user="$1"
     log_message "Terminating ALL sessions for user: $user"
-    
-    grep "^$user " "$USER_LOG" | while read -r username session_id session_key apikey url; do
-        log_message "  Terminating session ID: $session_id on server: $url"
-        local enc_user
-        enc_user=$(echo "$username" | sed 's/ /%20/g')
-        local msg="Too%20Many%20Streaming%20Sessions%20For%20USER%20${enc_user}%20between%20all%20PLEX%20servers!%20Only%20${MAX_STREAMS}%20are%20allowed%20at%20a%20time!"
-        local resp
-        resp=$(curl -s "${url}?apikey=${apikey}&cmd=terminate_session&session_id=${session_id}&session_key=${session_key}&message=${msg}")
-        log_message "  Terminate response: ${resp}"
-    done
+
+    while IFS='|' read -r username session_id session_key apikey url; do
+        if [ "$username" = "$user" ]; then
+            log_message "  Terminating session ID: $session_id on server: $url"
+            local enc_user
+            enc_user=$(echo "$username" | sed 's/ /%20/g')
+            local msg="Too%20Many%20Streaming%20Sessions%20For%20USER%20${enc_user}%20between%20all%20PLEX%20servers!%20Only%20${MAX_STREAMS}%20are%20allowed%20at%20a%20time!"
+            local resp
+            resp=$(curl -s "${url}?apikey=${apikey}&cmd=terminate_session&session_id=${session_id}&session_key=${session_key}&message=${msg}")
+            log_message "  Terminate response: ${resp}"
+        fi
+    done < "$USER_LOG"
 }
 
 # Main loop
@@ -109,7 +113,7 @@ while true; do
     log_message "Starting multi-server Tautulli check..."
 
     # CRITICAL: Reset the user log file at the start of each cycle
-    > "$USER_LOG"  # More efficient than rm + touch
+    > "$USER_LOG" # More efficient than rm + touch
 
     # Reset the user_counts array completely for each new check
     unset user_counts
@@ -131,27 +135,23 @@ while true; do
     # 2) Count sessions per user - ONLY from the current scan
     if [ -s "$USER_LOG" ]; then
         log_message "Processing user sessions from log file..."
-        
+
         # Create a temporary file to deduplicate sessions by user+session_id
         > "/tmp/unique_sessions.log"
-        
+
         # Use awk to deduplicate by username and session_id
-        awk '!seen[$1,$2]++' "$USER_LOG" > "/tmp/unique_sessions.log"
-        
+        awk -F'|' '!seen[$1,$2]++' "$USER_LOG" > "/tmp/unique_sessions.log"
+
         # Clear user log and copy back deduplicated entries
         > "$USER_LOG"
         cat "/tmp/unique_sessions.log" > "$USER_LOG"
-        
-        while read -r line; do
-            # Extract username (first field)
-            username=$(echo "$line" | awk '{print $1}')
-            
+
+        while IFS='|' read -r username session_id _rest; do
             if [ -n "$username" ]; then
-                # Increment count for this user
-                user_counts["$username"]=$((${user_counts["$username"]:-0} + 1))
+                user_counts["$username"]=$(( ${user_counts["$username"]:-0} + 1 ))
             fi
         done < "$USER_LOG"
-        
+
         # 3) Display user counts
         log_message "User session counts:"
         for user in "${!user_counts[@]}"; do
@@ -162,7 +162,7 @@ while true; do
                 log_message "   $user: ${user_counts[$user]} session(s)"
             fi
         done
-        
+
         # 4) Check for users exceeding limits and terminate their sessions
         for user in "${!user_counts[@]}"; do
             # Skip exempt users
@@ -170,7 +170,7 @@ while true; do
                 log_message "USER $user is exempt from the stream limit (${user_counts[$user]} active streams)"
                 continue
             fi
-            
+
             if [ "${user_counts[$user]}" -gt "$MAX_STREAMS" ]; then
                 log_message "USER $user has exceeded the stream limit! (${user_counts[$user]}/${MAX_STREAMS})"
                 kill_user_sessions "$user"
@@ -182,7 +182,6 @@ while true; do
 
     # Clean up temporary files
     rm -f "/tmp/unique_sessions.log" "$SERVER_TEMP_LOG"
-
     log_message "Check complete. Waiting ${WAIT_TIME} seconds for next run..."
     echo ""
     sleep "$WAIT_TIME"
